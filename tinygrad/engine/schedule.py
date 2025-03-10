@@ -209,9 +209,11 @@ def group_realizes(sink:UOp) -> dict[UOp, None]:
       ctx.realizes[tr] = None
     reduce_for_op.update((tr, r) for tr in group)
     if FUSE_ARANGE and r.arg[0] is Ops.ADD and r.src[0].base.op is Ops.CONST:
-      # maybe fuse arange with its children
-      if len(flatten(ctx.children[tr] for tr in group)) != 0:
-        for tr in group: del ctx.realizes[tr]
+      # (13631488, 1) (1703936, 1) aren't good
+      if r.shape in {(512, 1), (2, 1), (30522, 1)}:
+        # maybe fuse arange with its children
+        if len(flatten(ctx.children[tr] for tr in group)) != 0:
+          for tr in group: del ctx.realizes[tr]
   # fuse double reduces with no other child
   for reduceop in double_reduces:
     top_reduce = reduceop.src[0].base
