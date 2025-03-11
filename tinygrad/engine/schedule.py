@@ -113,9 +113,21 @@ sym = symbolic_simple+PatternMatcher([
 
 # **** swizzler
 
-view_left = PatternMatcher([])
+view_left = merge_views+PatternMatcher([])
 
-view_right = PatternMatcher([])
+def binop_view_right(binop:UOp, view:UOp, x:UOp):
+  new_src: list[UOp] = []
+  # don't change the order
+  for s in binop.src:
+    if s is view: new_src.append(s.base)
+    else:
+      assert s.op is not Ops.VIEW, f"can't push two views at the same time {s}"
+      new_src.append(s.view(unwrap(view.base.st)))
+  # NOTE: this becomes a contiguous
+  return binop.replace(src=tuple(new_src)).reshape(view.shape)
+view_right = merge_views+PatternMatcher([
+  (UPat(GroupOp.Binary, src=[UPat.var("x"), UPat(Ops.VIEW, name="view")], name="binop"), binop_view_right),
+])
 
 # **** create kernels
 
@@ -217,7 +229,7 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
   type_verify(list(contiguous_sink.toposort), contiguous_spec)
   # create_kernels
   kernel_map = graph_rewrite_map(contiguous_sink, create_kernels, ctx=KernelContext({}))
-  sched_sink = kernel_map[sink]
+  sched_sink = kernel_map[contiguous_sink]
   type_verify(list(sched_sink.toposort), kernel_spec)
   assert len(sched_sink.src) == len(sink.src)
   # track back to the tensors
