@@ -145,6 +145,10 @@ shape_spec = PatternMatcher([
   (UPat(GroupOp.All-{Ops.SINK}, name="root"), lambda root: all_same([x.shape for x in root.src if x.st is not None])),
 ])
 
+contiguous_spec = shape_spec+PatternMatcher([
+  (UPat(Ops.VIEW, src=(UPat(GroupOp.All-{Ops.DEVICE, Ops.CONST, Ops.COPY, Ops.ASSIGN, Ops.CONTIGUOUS}),)), lambda: False),
+])
+
 # ***** uop helpers *****
 
 def type_verify(uops:list[UOp], *extra_specs:PatternMatcher):

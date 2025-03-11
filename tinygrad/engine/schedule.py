@@ -2,7 +2,7 @@ import sys, atexit, pickle
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from tinygrad.ops import UOp, Variable, Ops, GroupOp, PatternMatcher, UPat, graph_rewrite, graph_rewrite_map, track_rewrites, buffers
-from tinygrad.ops import can_pad, identity_element, resolve, view_left, merge_views
+from tinygrad.ops import can_pad, identity_element, resolve, merge_views
 from tinygrad.codegen.symbolic import symbolic_simple
 from tinygrad.helpers import Context, ContextVar, Metadata, all_int, all_same, colored, diskcache_put, prod, dedup, unwrap, flatten, getenv, pluralize
 from tinygrad.helpers import FUSE_CONV_BW, FUSE_ARANGE, DEBUG, CAPTURE_PROCESS_REPLAY, DONT_REALIZE_EXPAND, DONT_GROUP_REDUCES, SPLIT_REDUCEOP
@@ -10,7 +10,7 @@ from tinygrad.dtype import ImageDType
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.view import View, strides_for_shape
 from tinygrad.device import Buffer
-from tinygrad.spec import type_verify, kernel_spec
+from tinygrad.spec import type_verify, kernel_spec, contiguous_spec
 
 # creation can recurse a lot
 sys.setrecursionlimit(10000)
@@ -111,6 +111,12 @@ sym = symbolic_simple+PatternMatcher([
     if (new_src:=tuple(dedup(s.base for s in x.src if s.op not in {Ops.CONST,Ops.BIND}))) != x.src else None),
 ])
 
+# **** swizzler
+
+view_left = PatternMatcher([])
+
+view_right = PatternMatcher([])
+
 # **** create kernels
 
 @dataclass(frozen=True)
@@ -203,16 +209,20 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
   # display the cleaned up tensor graph
   if getenv("VIZ"): graph_rewrite(tensor_map[big_sink], PatternMatcher([]), name="View Tensor Graph")
 
-  # get realizes
+  # view_left + view_right
   sink = tensor_map[big_sink]
-  # map tensor metadata to simplified ops
-  ops_metadata = {v:k.metadata for k,v in tensor_map.items() if k.base.op not in {Ops.CONST, Ops.DEVICE} and isinstance(k.metadata, Metadata)}
+  view_left_map = graph_rewrite_map(sink, view_left)
+  view_right_map = graph_rewrite_map(view_left_map[sink], view_right)
+  contiguous_sink = view_right_map[view_left_map[sink]]
+  type_verify(list(contiguous_sink.toposort), contiguous_spec)
   # create_kernels
-  kernel_map = graph_rewrite_map(sink, create_kernels, ctx=KernelContext(ops_metadata))
+  kernel_map = graph_rewrite_map(contiguous_sink, create_kernels, ctx=KernelContext({}))
   sched_sink = kernel_map[sink]
-  assert len(sched_sink.src) == len(sink.src)
-  for s1,s2 in zip(sink.src, sched_sink.src): kernel_map[s1] = s2
   type_verify(list(sched_sink.toposort), kernel_spec)
+  assert len(sched_sink.src) == len(sink.src)
+  # track back to the tensors
+  kernel_map: dict[UOp, UOp] = {}
+  for s1,s2 in zip(sink.src, sched_sink.src): kernel_map[s1] = s2
 
   # map tensors to buffer/const, optionally apply a VIEW on top
   becomes_map: dict[UOp, UOp] = {}
