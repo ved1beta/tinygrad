@@ -119,7 +119,21 @@ remove_sink_views = PatternMatcher([
   (UPat(Ops.SINK, name="x"), lambda x:x.replace(src=tuple(s.base for s in x.src)) if any(s.op is Ops.VIEW for s in x.src) else None),
 ])
 
-view_left = merge_views+PatternMatcher([])
+def swizzle_reduceop(r:UOp, src:UOp, view:UOp):
+  if (st:=unwrap(view.st)).contiguous: return None
+  input_st = ShapeTracker.from_shape(src.shape)
+  tmp = input_st.permute(tuple(i for i in range(len(input_st.shape)) if i not in r.axis_arg)+r.axis_arg)
+  prshape = prod(rshape:=tmp.shape[-len(r.axis_arg):])
+  strides = strides_for_shape(rshape)
+  nv = [View.create(v.shape+rshape, tuple(x*prshape for x in v.strides)+strides,
+                    v.offset*prshape, v.mask+tuple((0,s) for s in rshape) if v.mask is not None else None) for v in st.views]
+  # update input_st and axis
+  new_input_st = tmp + ShapeTracker(tuple(nv))
+  new_axis = tuple(range(len(st.shape), len(st.shape) + len(r.axis_arg)))
+  return src.view(new_input_st).r(r.arg[0], new_axis).reshape(st.shape)
+
+view_left = merge_views+PatternMatcher([
+])
 
 def binop_view_right(binop:UOp, view:UOp, x:UOp):
   new_src: list[UOp] = []
@@ -127,15 +141,25 @@ def binop_view_right(binop:UOp, view:UOp, x:UOp):
   for s in binop.src:
     if s is view: new_src.append(s.base)
     else:
-      assert s.op is not Ops.VIEW, f"can't push two views at the same time {s}"
+      if s.op is Ops.VIEW:
+        assert s.st == view.st, f"can't push through different views in {binop=}"
       new_src.append(s.view(unwrap(view.base.st)))
   # NOTE: this becomes a contiguous
   return binop.replace(src=tuple(new_src)).reshape(view.shape)
 
+def reduceop_view_right(src:UOp, v:UOp, r:UOp):
+  assert unwrap(v.st).contiguous and v.size == src.size, f"can't compute new axis for {src.shape} -> {r.shape}"
+  return src.r(r.arg[0], tuple(i for i,(s,u) in enumerate(zip(src.shape, r.shape)) if s != u)).view(ShapeTracker.from_shape(r.shape))
+
 view_right = merge_views+PatternMatcher([
   (UPat(GroupOp.Binary, src=[UPat.var("x"), UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED),), name="view")], name="binop"), binop_view_right),
-  # passthrough contiguous
-  (UPat(Ops.CONTIGUOUS, src=(UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED),), name="view"),)), lambda view:view.base.contiguous().view(view.arg)),
+  # push expand through reduce by making the reduce on a larger dim
+  (UPat(Ops.VIEW, src=(UPat(Ops.REDUCE_AXIS, src=(UPat.var("src"),), name="r"),), name="view"), swizzle_reduceop),
+  # passthrough unary
+  (UPat({*GroupOp.Unary, Ops.CAST, Ops.BITCAST}, src=(UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED),), name="view"),), name="alu"),
+   lambda view,alu: alu.replace(src=(view.base,)).view(view.arg)),
+  # passthrough reduce
+  (UPat(Ops.REDUCE_AXIS, src=(UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED, name="src"),), name="v"),), name="r"), reduceop_view_right),
 ])
 
 # **** create kernels
@@ -170,7 +194,7 @@ def append_to_kernel(ctx:KernelContext, x:UOp):
 create_kernels = merge_views+remove_sink_views+PatternMatcher([
   # always give assign/contiguous a kernel
   (UPat.assign(UPat.var("b"), UPat(GroupOp.All-{Ops.KERNEL}), name="x"), create_kernel),
-  (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda ctx,x: create_kernel(ctx, x, UOp.new_buffer(x.device, x.size, x.dtype))),
+  (UPat(Ops.CONTIGUOUS, name="x"), lambda ctx,x: create_kernel(ctx, x, UOp.new_buffer(x.device, x.size, x.dtype))),
   # create a buffer for COPY on the new device
   (UPat(Ops.COPY, src=(UPat(Ops.DEVICE, name="d"), UPat()), name="x"), lambda ctx,d,x: create_kernel(ctx, x, UOp.new_buffer(d.arg, x.size, x.dtype))),
   # walk back the local graph until we reach a buffer/assign parent
@@ -193,8 +217,11 @@ add_buffer_ops = PatternMatcher([
   # CONST/VALID
   (UPat(Ops.CONST, src=(UPat(Ops.VIEW, src=(UPat(Ops.DEVICE),), name="view"),), name="x"), lambda x,view:x.replace(src=(view.arg.to_uop(),))),
   (UPat(Ops.VIEW, src=(UPat(Ops.CONST, name="x"),), name="view"), lambda view,x:x.valid(view.arg)),
+  # no contiguous
+  (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda x:x),
   # +merge_views
   (UPat(Ops.VIEW, src=(UPat(Ops.LOAD, name="x"),), name="view"), lambda view,x: x.replace(src=(x.src[0], (x.src[1].arg+view.arg).to_uop()))),
+  (UPat(Ops.STORE, src=(UPat.var("b"), UPat.var("st"), UPat(Ops.VIEW, src=(UPat.var("base"),)))), lambda b,st,base: UOp.store(b, st.view(base.st), base)),
 ])+merge_views
 
 def fix_kernel_ast(k:UOp, var_vals:dict[Variable, int], idx:int) -> UOp:
