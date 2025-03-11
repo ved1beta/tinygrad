@@ -106,6 +106,9 @@ sym = symbolic_simple+PatternMatcher([
   # put CAST after expanding BUFFER
   (UPat(Ops.VIEW, src=(UPat(Ops.CAST, src=(UPat.var("x"),)),), name="v"), lambda x,v: x.view(x.st+v.st).cast(v.dtype) if getenv("CAST_AFTER_EXPAND")
     and x.base.op is Ops.BUFFER and resolve(prod(v.shape) > prod(x.shape)) else None),
+  # remove CONST/BIND/VIEW from SINK
+  (UPat(Ops.SINK, name="x"), lambda x: x.replace(src=new_src)
+    if (new_src:=tuple(dedup(s.base for s in x.src if s.op not in {Ops.CONST,Ops.BIND}))) != x.src else None),
 ])
 
 # **** create kernels
@@ -145,9 +148,8 @@ create_kernels = merge_views+PatternMatcher([
   (UPat(Ops.COPY, src=(UPat(Ops.DEVICE, name="d"), UPat()), name="x"), lambda ctx,d,x: create_kernel(ctx, x, UOp.new_buffer(d.arg, x.size, x.dtype))),
   # walk back the local graph until we reach a buffer/assign parent
   (UPat(Ops.KERNEL, name="x"), append_to_kernel),
-  # remove CONST/BIND from SINK
-  (UPat(Ops.SINK, name="x"), lambda x: x.replace(src=new_src)
-    if (new_src:=tuple(dedup(s.base for s in x.src if s.op not in {Ops.CONST,Ops.BIND}))) != x.src else None),
+  # remove downstream reshapes from SINK
+  (UPat(Ops.SINK, name="x"), lambda x:x.replace(src=tuple(s.base for s in x.src)) if any(s.op is Ops.VIEW for s in x.src) else None),
   # all ops in SINK get a kernel
   (UPat(Ops.SINK, name="x"), lambda ctx,x: x.replace(src=new_src)
     if (new_src:=tuple(s if s.op in DONT_PLACE_IN_KERNEL else s.contiguous() for s in x.src)) != x.src else None),
@@ -205,6 +207,8 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
   # create_kernels
   kernel_map = graph_rewrite_map(sink, create_kernels, ctx=KernelContext(ops_metadata))
   sched_sink = kernel_map[sink]
+  assert len(sched_sink.src) == len(sink.src)
+  for s1,s2 in zip(sink.src, sched_sink.src): kernel_map[s1] = s2
   type_verify(list(sched_sink.toposort), kernel_spec)
 
   # map tensors to buffer/const, optionally apply a VIEW on top
