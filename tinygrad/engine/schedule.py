@@ -271,6 +271,7 @@ create_kernels = merge_views+PatternMatcher([
 add_buffer_ops = PatternMatcher([
   # LOAD
   (UPat(Ops.BUFFER, name="x"), lambda ctx,x: UOp(Ops.LOAD, x.dtype, (UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(x.size), (), ctx.index(x)), x.st.to_uop()))),
+  (UPat(Ops.ASSIGN, src=(UPat.var("x"), UPat())), lambda x:x),
   # STORE (except for COPY/BUFFER_VIEW)
   (UPat(Ops.SINK, src=(UPat((Ops.COPY, Ops.BUFFER_VIEW), name="x"),)), lambda x:x),
   (UPat(Ops.SINK, src=(UPat(GroupOp.All-{Ops.STORE}, name="x"),)),
@@ -376,7 +377,7 @@ def fix_kernel_ast(k:UOp, var_vals:dict[Variable, int]) -> UOp:
   parents_rep: dict[UOp, UOp] = {}
   for s in k.src:
     if s.op is Ops.ASSIGN:
-      for out in s.src[1].arg.ast.src: parents_rep[out] = s.buf_uop.view(unwrap(out.st))
+      for out in s.src[1].arg.ast.src: parents_rep[out] = s.view(unwrap(out.st))
   ast = k.arg.ast.substitute(parents_rep)
   # add buffer ops
   ast = graph_rewrite(ast, add_buffer_ops, bufs:=tuple(s.buf_uop for s in k.src), bottom_up=True)
