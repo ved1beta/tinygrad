@@ -113,6 +113,8 @@ sym = symbolic_simple+PatternMatcher([
 
 # **** swizzler
 
+GROUPED = {Ops.BUFFER, Ops.ASSIGN, Ops.CONTIGUOUS, Ops.COPY, Ops.CONST}
+
 view_left = merge_views+PatternMatcher([])
 
 def binop_view_right(binop:UOp, view:UOp, x:UOp):
@@ -126,7 +128,7 @@ def binop_view_right(binop:UOp, view:UOp, x:UOp):
   # NOTE: this becomes a contiguous
   return binop.replace(src=tuple(new_src)).reshape(view.shape)
 view_right = merge_views+PatternMatcher([
-  (UPat(GroupOp.Binary, src=[UPat.var("x"), UPat(Ops.VIEW, name="view")], name="binop"), binop_view_right),
+  (UPat(GroupOp.Binary, src=[UPat.var("x"), UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED),), name="view")], name="binop"), binop_view_right),
 ])
 
 # **** create kernels
@@ -233,8 +235,12 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
   type_verify(list(sched_sink.toposort), kernel_spec)
   assert len(sched_sink.src) == len(sink.src)
   # track back to the tensors
-  kernel_map: dict[UOp, UOp] = {}
+  buffer_map: dict[UOp, UOp] = {}
   for s1,s2 in zip(sink.src, sched_sink.src): kernel_map[s1] = s2
+  for k,v in tensor_map.items():
+    if v.base.op in {Ops.CONST, Ops.BIND, Ops.DEVICE}: continue
+    kernel = kernel_map[v.base]
+    if (a:=kernel.base).op is Ops.ASSIGN: buffer_map[v] = a.src[0] if a.src[0].st == v.st else a.src[0].view(unwrap(v.st))
 
   # map tensors to buffer/const, optionally apply a VIEW on top
   becomes_map: dict[UOp, UOp] = {}
@@ -242,8 +248,7 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
     # ASSIGN always becomes the target buffer
     if v.op is Ops.ASSIGN: becomes_map[k] = v.src[0]
     # if we created a new buffer for this tensor, map it to the assigned buffer
-    elif (a:=kernel_map.get(v.base)) is not None and (a:=a.base).op is Ops.ASSIGN:
-      becomes_map[k] = a.src[0] if a.src[0].st == v.st else a.src[0].view(unwrap(v.st))
+    elif (buf_view:=buffer_map.get(v)) is not None: becomes_map[k] = buf_view
     # tensors can also simplify to an existing buffer/const
     else:
       if k is v: continue
