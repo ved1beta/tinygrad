@@ -130,35 +130,33 @@ def swizzle_reduceop(r:UOp, src:UOp, view:UOp):
   # update input_st and axis
   new_input_st = tmp + ShapeTracker(tuple(nv))
   new_axis = tuple(range(len(st.shape), len(st.shape) + len(r.axis_arg)))
-  return src.view(new_input_st).r(r.arg[0], new_axis).reshape(st.shape)
+  return UOp(Ops.REDUCE_AXIS, r.dtype, (UOp(Ops.VIEW, src.dtype, (src,), new_input_st),), (r.arg[0], new_axis)).reshape(st.shape)
 
 view_left = merge_views+PatternMatcher([
+  # VIEW before elementwise/buffer ops
+  (UPat(Ops.VIEW, src=(UPat(GroupOp.All-{*GROUPED, Ops.DEVICE, Ops.REDUCE_AXIS}, name="x"),), name="view"),
+   lambda x,view: x.replace(src=tuple(UOp(Ops.VIEW, s.dtype, (s,), view.arg) for s in x.src))),
 ])
 
-def binop_view_right(binop:UOp, view:UOp, x:UOp):
-  new_src: list[UOp] = []
-  # don't change the order
-  for s in binop.src:
-    if s is view: new_src.append(s.base)
-    else:
-      if s.op is Ops.VIEW:
-        assert s.st == view.st, f"can't push through different views in {binop=}"
-      new_src.append(s.view(unwrap(view.base.st)))
-  # NOTE: this becomes a contiguous
-  return binop.replace(src=tuple(new_src)).reshape(view.shape)
+def passthrough_elementwise(root:UOp):
+  if not (swizzles:=[x for x in root.src if x.op is Ops.VIEW and x.base.op not in GROUPED]): return None
+  assert all_same([x.base.size for x in swizzles]), f"swizzle inputs must have the same size {swizzles}"
+  # place view after applying the elementwise op
+  new_shape = swizzles[0].base.shape
+  ret = root.replace(src=tuple(x.base if x.base.shape == new_shape else x.reshape(new_shape) for x in root.src))
+  # reshape to match downstream shapes
+  return ret.reshape(root.shape)
 
 def reduceop_view_right(src:UOp, v:UOp, r:UOp):
   assert unwrap(v.st).contiguous and v.size == src.size, f"can't compute new axis for {src.shape} -> {r.shape}"
   return src.r(r.arg[0], tuple(i for i,(s,u) in enumerate(zip(src.shape, r.shape)) if s != u)).view(ShapeTracker.from_shape(r.shape))
 
 view_right = merge_views+PatternMatcher([
-  (UPat(GroupOp.Binary, src=[UPat.var("x"), UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED),), name="view")], name="binop"), binop_view_right),
   # push expand through reduce by making the reduce on a larger dim
   (UPat(Ops.VIEW, src=(UPat(Ops.REDUCE_AXIS, src=(UPat.var("src"),), name="r"),), name="view"), swizzle_reduceop),
-  # passthrough unary
-  (UPat({*GroupOp.Unary, Ops.CAST, Ops.BITCAST}, src=(UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED),), name="view"),), name="alu"),
-   lambda view,alu: alu.replace(src=(view.base,)).view(view.arg)),
-  # passthrough reduce
+  # passthrough elementwise ops
+  (UPat(GroupOp.All-{*GROUPED, Ops.SINK}, name="root"), passthrough_elementwise),
+  # reduce on the base
   (UPat(Ops.REDUCE_AXIS, src=(UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED, name="src"),), name="v"),), name="r"), reduceop_view_right),
 ])
 
@@ -269,10 +267,11 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
   assert len(sched_sink.src) == len(sink.src)
   # track back to the tensors
   buffer_map: dict[UOp, UOp] = {}
-  for s1,s2 in zip(sink.src, sched_sink.src): kernel_map[s1] = s2
+  for s1,s2 in zip(contiguous_sink.src, sched_sink.src): kernel_map[s1] = s2
   for k,v in tensor_map.items():
     if v.base not in vl_map: continue
     vl = vl_map[v.base]
+    if vl not in vr_map: continue
     vr = vr_map[vl]
     if vr.base not in kernel_map: continue
     kernel = kernel_map[vr.base]
