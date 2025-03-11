@@ -165,14 +165,17 @@ add_buffer_ops = PatternMatcher([
   (UPat(Ops.SINK, src=(UPat((Ops.COPY, Ops.BUFFER_VIEW), name="x"),)), lambda x:x),
   (UPat(Ops.SINK, src=(UPat(GroupOp.All-{Ops.STORE}, name="x"),)),
    lambda x: UOp.store(UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(x.size), (), 0), ShapeTracker.from_shape(x.shape).to_uop(), x).sink()),
+  # CONST/VALID
+  (UPat(Ops.CONST, src=(UPat(Ops.VIEW, src=(UPat(Ops.DEVICE),), name="view"),), name="x"), lambda x,view:x.replace(src=(view.arg.to_uop(),))),
+  (UPat(Ops.VIEW, src=(UPat(Ops.CONST, name="x"),), name="view"), lambda view,x:x.valid(view.arg)),
   # +merge_views
-  (UPat(Ops.VIEW, src=(UPat(Ops.LOAD, name="ld"),), name="view"), lambda ld,view: ld.replace(src=(ld.src[0], (ld.src[1].arg+view.arg).to_uop()))),
+  (UPat(Ops.VIEW, src=(UPat(Ops.LOAD, name="x"),), name="view"), lambda view,x: x.replace(src=(x.src[0], (x.src[1].arg+view.arg).to_uop()))),
 ])+merge_views
 
-def fix_kernel_ast(k:UOp, var_vals:dict[Variable, int]) -> UOp:
+def fix_kernel_ast(k:UOp, var_vals:dict[Variable, int], idx:int) -> UOp:
   assert k.op is Ops.KERNEL, f"kernel isn't kernel, it's {k}"
   # add buffer ops
-  ast = graph_rewrite(k.arg.ast, add_buffer_ops, bufs:=tuple(s.buf_uop for s in k.src), bottom_up=True)
+  ast = graph_rewrite(k.arg.ast, add_buffer_ops, bufs:=tuple(s.buf_uop for s in k.src), bottom_up=True, name=f"ast_{idx}")
   if ast.op is Ops.SINK and not all_same(dev:=[x.device for x in bufs]): raise RuntimeError(f"all buffers must be on the same device: {dev}")
   # create subbuffer (TODO: this does not belong here)
   if ast.op is Ops.BUFFER_VIEW: buffers[bufs[0]] = (base:=bufs[1].buffer).view(ast.size, ast.dtype, ast.arg[1]*base.dtype.itemsize)
@@ -260,7 +263,7 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
   while queue:
     u = queue.popleft()
     # TODO: move this to create_kernels
-    k = fix_kernel_ast(u.src[1], var_vals)
+    k = fix_kernel_ast(u.src[1], var_vals, idx=len(schedule))
     schedule.append(ScheduleItem(k.arg.ast, tuple(s.buf_uop.buffer for s in k.src), k.arg.metadata))
     # increment the refcount of the target buf (this is required by the JIT and memory planner) TODO: this does not belong here
     k.src[0].buffer.ref(1)
