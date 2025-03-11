@@ -108,7 +108,7 @@ sym = symbolic_simple+PatternMatcher([
     and x.base.op is Ops.BUFFER and resolve(prod(v.shape) > prod(x.shape)) else None),
 ])
 
-# break the SINK into kernels
+# **** create kernels
 
 @dataclass(frozen=True)
 class Kernel:
@@ -148,9 +148,10 @@ create_kernels = merge_views+PatternMatcher([
   # remove CONST/BIND from SINK
   (UPat(Ops.SINK, name="x"), lambda x: x.replace(src=new_src)
     if (new_src:=tuple(dedup(s.base for s in x.src if s.op not in {Ops.CONST,Ops.BIND}))) != x.src else None),
+  # all ops in SINK get a kernel
+  (UPat(Ops.SINK, name="x"), lambda ctx,x: x.replace(src=new_src)
+    if (new_src:=tuple(s if s.op in DONT_PLACE_IN_KERNEL else s.contiguous() for s in x.src)) != x.src else None),
 ])
-
-# **** fix kernel AST
 
 # ** create buffer ops + enumerate buffers
 
@@ -162,60 +163,9 @@ add_buffer_ops = PatternMatcher([
   (UPat(Ops.SINK, src=(UPat((Ops.COPY, Ops.BUFFER_VIEW), name="x"),)), lambda x:x),
   (UPat(Ops.SINK, src=(UPat(GroupOp.All-{Ops.STORE}, name="x"),)),
    lambda x: UOp.store(UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(x.size), (), 0), ShapeTracker.from_shape(x.shape).to_uop(), x).sink()),
-])
-
-# ** push views to buffer ops
-
-def apply_swizzle(u:UOp) -> UOp:
-  with Context(TRACK_MATCH_STATS=0): return graph_rewrite(u, view_left)
-
-def swizzle_reduceop(r:UOp, src:UOp, view:UOp):
-  if (st:=unwrap(view.st)).contiguous: return None
-  input_st = ShapeTracker.from_shape(src.shape)
-  tmp = input_st.permute(tuple(i for i in range(len(input_st.shape)) if i not in r.axis_arg)+r.axis_arg)
-  prshape = prod(rshape:=tmp.shape[-len(r.axis_arg):])
-  strides = strides_for_shape(rshape)
-  nv = [View.create(v.shape+rshape, tuple(x*prshape for x in v.strides)+strides,
-                    v.offset*prshape, v.mask+tuple((0,s) for s in rshape) if v.mask is not None else None) for v in st.views]
-  # update input_st and axis
-  new_input_st = tmp + ShapeTracker(tuple(nv))
-  new_axis = tuple(range(len(st.shape), len(st.shape) + len(r.axis_arg)))
-  return apply_swizzle(src.view(new_input_st)).r(r.arg[0], new_axis).view(ShapeTracker.from_shape(st.shape))
-
-def reduceop_view_right(src:UOp, v:UOp, r:UOp):
-  assert unwrap(v.st).contiguous and v.size == src.size, f"can't compute new axis for {src.shape} -> {r.shape}"
-  return src.r(r.arg[0], tuple(i for i,(s,u) in enumerate(zip(src.shape, r.shape)) if s != u)).view(ShapeTracker.from_shape(r.shape))
-
-def elementwise_view_right(root:UOp) -> UOp|None:
-  if not (swizzles:=[x for x in root.src if x.op is Ops.VIEW]): return None
-  assert all_same([x.base.size for x in swizzles]), f"swizzle inputs must have the same size {swizzles}"
-  # place view after applying the elementwise op
-  new_shape = swizzles[0].base.shape
-  ret = root.replace(src=tuple(x.base if x.base.shape == new_shape else apply_swizzle(x.view(ShapeTracker.from_shape(new_shape))) for x in root.src))
-  # reshape to match downstream shapes
-  return ret.reshape(root.shape)
-
-def merge_double_reduce(root:UOp, first_reduce:UOp) -> UOp:
-  assert root.arg[0] == first_reduce.arg[0], "can't merge reduceops with different alu"
-  assert not any(x.op is Ops.REDUCE_AXIS for x in first_reduce.src[0].toposort), "can't merge more than two reduceops at a time"
-  return first_reduce.replace(arg=(first_reduce.arg[0], root.axis_arg+first_reduce.axis_arg))
-
-# push VIEW to children
-view_right = merge_views+PatternMatcher([
-  # STORE(.., ASSIGN(VIEW(BUFFER), new_val)) -> VIEW(STORE(.., new_val))
-  (UPat(Ops.STORE, src=(UPat.var("b"), UPat.var("st"), UPat.assign(UPat.var("target"), UPat.var("val")))),
-   lambda b,target,st,val: apply_swizzle(UOp.store(b, st, val).view(target.st))),
-  # STORE is the last child, so we just merge the ShapeTrackers and store the base
-  (UPat(Ops.STORE, src=(UPat.var("b"), UPat.var("st"), UPat(Ops.VIEW, src=(UPat.var("val"),)))), lambda b,st,val: UOp.store(b, st.view(val.st), val)),
-  # push a non contiguous ShapeTracker through reduceop
-  (UPat(Ops.VIEW, src=(UPat(Ops.REDUCE_AXIS, src=(UPat.var("src"),), name="r"),), name="view"), swizzle_reduceop),
-  # apply view after reduceops
-  (UPat(Ops.REDUCE_AXIS, src=(UPat(Ops.VIEW, src=(UPat.var("src"),), name="v"),), name="r"), reduceop_view_right),
-  # apply view after elementwise ops
-  (UPat(GroupOp.All-GroupOp.Buffer, name="root"), elementwise_view_right),
-  # double reduce op collapses to a single reduce op
-  (UPat(Ops.REDUCE_AXIS, src=(UPat(Ops.REDUCE_AXIS, name="first_reduce"),), name="root"), merge_double_reduce),
-])
+  # +merge_views
+  (UPat(Ops.VIEW, src=(UPat(Ops.LOAD, name="ld"),), name="view"), lambda ld,view: ld.replace(src=(ld.src[0], (ld.src[1].arg+view.arg).to_uop()))),
+])+merge_views
 
 def fix_kernel_ast(k:UOp, var_vals:dict[Variable, int]) -> UOp:
   assert k.op is Ops.KERNEL, f"kernel isn't kernel, it's {k}"
