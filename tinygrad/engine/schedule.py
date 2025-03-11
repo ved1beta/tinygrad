@@ -115,6 +115,10 @@ sym = symbolic_simple+PatternMatcher([
 
 GROUPED = {Ops.BUFFER, Ops.ASSIGN, Ops.CONTIGUOUS, Ops.COPY, Ops.CONST}
 
+remove_sink_views = PatternMatcher([
+  (UPat(Ops.SINK, name="x"), lambda x:x.replace(src=tuple(s.base for s in x.src)) if any(s.op is Ops.VIEW for s in x.src) else None),
+])
+
 view_left = merge_views+PatternMatcher([])
 
 def binop_view_right(binop:UOp, view:UOp, x:UOp):
@@ -127,8 +131,11 @@ def binop_view_right(binop:UOp, view:UOp, x:UOp):
       new_src.append(s.view(unwrap(view.base.st)))
   # NOTE: this becomes a contiguous
   return binop.replace(src=tuple(new_src)).reshape(view.shape)
+
 view_right = merge_views+PatternMatcher([
   (UPat(GroupOp.Binary, src=[UPat.var("x"), UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED),), name="view")], name="binop"), binop_view_right),
+  # passthrough contiguous
+  (UPat(Ops.CONTIGUOUS, src=(UPat(Ops.VIEW, src=(UPat.var("x"),), name="view"),)), lambda x,view:x.contiguous().view(view.arg)),
 ])
 
 # **** create kernels
@@ -160,7 +167,7 @@ def append_to_kernel(ctx:KernelContext, x:UOp):
       if (m:=ctx.ops_metadata.get(s)) is not None: metadata[m] = None
   if (new_src:=tuple(dedup(new_srcs))) != x.src: return x.replace(src=new_src, arg=Kernel(x.arg.ast, tuple(metadata)))
 
-create_kernels = merge_views+PatternMatcher([
+create_kernels = merge_views+remove_sink_views+PatternMatcher([
   # always give assign/contiguous a kernel
   (UPat.assign(UPat.var("b"), UPat(GroupOp.All-{Ops.KERNEL}), name="x"), create_kernel),
   (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda ctx,x: create_kernel(ctx, x, UOp.new_buffer(x.device, x.size, x.dtype))),
@@ -168,8 +175,6 @@ create_kernels = merge_views+PatternMatcher([
   (UPat(Ops.COPY, src=(UPat(Ops.DEVICE, name="d"), UPat()), name="x"), lambda ctx,d,x: create_kernel(ctx, x, UOp.new_buffer(d.arg, x.size, x.dtype))),
   # walk back the local graph until we reach a buffer/assign parent
   (UPat(Ops.KERNEL, name="x"), append_to_kernel),
-  # remove downstream reshapes from SINK
-  (UPat(Ops.SINK, name="x"), lambda x:x.replace(src=tuple(s.base for s in x.src)) if any(s.op is Ops.VIEW for s in x.src) else None),
   # all ops in SINK get a kernel
   (UPat(Ops.SINK, name="x"), lambda ctx,x: x.replace(src=new_src)
     if (new_src:=tuple(s if s.op in DONT_PLACE_IN_KERNEL else s.contiguous() for s in x.src)) != x.src else None),
@@ -225,9 +230,10 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
 
   # view_left + view_right
   sink = tensor_map[big_sink]
-  view_left_map = graph_rewrite_map(sink, view_left)
-  view_right_map = graph_rewrite_map(view_left_map[sink], view_right)
-  contiguous_sink = view_right_map[view_left_map[sink]]
+  vl_map = graph_rewrite_map(sink, view_left)
+  vr_map = graph_rewrite_map(vl_map[sink], view_right+remove_sink_views)
+  contiguous_sink = vr_map[vl_map[sink]]
+  if getenv("VIZ"): graph_rewrite(contiguous_sink, PatternMatcher([]), name="View Contiguous Graph")
   type_verify(list(contiguous_sink.toposort), contiguous_spec)
   # create_kernels
   kernel_map = graph_rewrite_map(contiguous_sink, create_kernels, ctx=KernelContext({}))
@@ -239,7 +245,9 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
   for s1,s2 in zip(sink.src, sched_sink.src): kernel_map[s1] = s2
   for k,v in tensor_map.items():
     if v.base.op in {Ops.CONST, Ops.BIND, Ops.DEVICE}: continue
-    kernel = kernel_map[v.base]
+    vl = vl_map[v.base]
+    vr = vr_map[vl]
+    kernel = kernel_map[vr.base]
     if (a:=kernel.base).op is Ops.ASSIGN: buffer_map[v] = a.src[0] if a.src[0].st == v.st else a.src[0].view(unwrap(v.st))
 
   # map tensors to buffer/const, optionally apply a VIEW on top
