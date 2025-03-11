@@ -135,7 +135,7 @@ def binop_view_right(binop:UOp, view:UOp, x:UOp):
 view_right = merge_views+PatternMatcher([
   (UPat(GroupOp.Binary, src=[UPat.var("x"), UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED),), name="view")], name="binop"), binop_view_right),
   # passthrough contiguous
-  (UPat(Ops.CONTIGUOUS, src=(UPat(Ops.VIEW, src=(UPat.var("x"),), name="view"),)), lambda x,view:x.contiguous().view(view.arg)),
+  (UPat(Ops.CONTIGUOUS, src=(UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED),), name="view"),)), lambda view:view.base.contiguous().view(view.arg)),
 ])
 
 # **** create kernels
@@ -244,9 +244,10 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
   buffer_map: dict[UOp, UOp] = {}
   for s1,s2 in zip(sink.src, sched_sink.src): kernel_map[s1] = s2
   for k,v in tensor_map.items():
-    if v.base.op in {Ops.CONST, Ops.BIND, Ops.DEVICE}: continue
+    if v.base not in vl_map: continue
     vl = vl_map[v.base]
     vr = vr_map[vl]
+    if vr.base not in kernel_map: continue
     kernel = kernel_map[vr.base]
     if (a:=kernel.base).op is Ops.ASSIGN: buffer_map[v] = a.src[0] if a.src[0].st == v.st else a.src[0].view(unwrap(v.st))
 
