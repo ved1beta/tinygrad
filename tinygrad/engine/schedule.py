@@ -120,10 +120,13 @@ remove_sink_views = PatternMatcher([
 ])
 
 view_left = merge_views+PatternMatcher([
+  # realize before expand
+  (UPat(Ops.VIEW, src=(UPat(GroupOp.All-{*GROUPED, Ops.DEVICE}, name="x"),), name="view"),
+   lambda view,x: x.contiguous().view(view.st) if prod(view.shape) > prod(x.shape) else None),
   # do not push pads through unsafe ops
   (UPat(Ops.VIEW, src=(UPat(GroupOp.UnsafePad, name="unsafe"),), name="view"),
    lambda view,unsafe: unsafe.contiguous().view(view.st) if any(v.mask is not None for v in view.st.views) else None),
-  # VIEW before elementwise/buffer ops
+  # VIEW before elementwise ops
   (UPat(Ops.VIEW, src=(UPat(GroupOp.All-{*GROUPED, Ops.DEVICE, Ops.REDUCE_AXIS}, name="x"),), name="view"),
    lambda x,view: x.replace(src=tuple(UOp(Ops.VIEW, s.dtype, (s,), view.arg) for s in x.src))),
 ])
@@ -132,6 +135,7 @@ def apply_view_left(u:UOp):
   with Context(TRACK_MATCH_STATS=0): return graph_rewrite(u, view_left)
 
 def swizzle_reduceop(r:UOp, src:UOp, view:UOp):
+  if not getenv("PUSH_MOVEMENT_OPS"): return r.contiguous().view(view.st)
   if (st:=unwrap(view.st)).contiguous: return None
   input_st = ShapeTracker.from_shape(src.shape)
   tmp = input_st.permute(tuple(i for i in range(len(input_st.shape)) if i not in r.axis_arg)+r.axis_arg)
@@ -159,12 +163,12 @@ def reduceop_view_right(src:UOp, v:UOp, r:UOp):
   return src.r(r.arg[0], tuple(i for i,(s,u) in enumerate(zip(src.shape, r.shape)) if s != u)).view(ShapeTracker.from_shape(r.shape))
 
 view_right = merge_views+PatternMatcher([
-  # push expand through reduce by making the reduce on a larger dim
+  # push movement ops through reduce
   (UPat(Ops.VIEW, src=(UPat(Ops.REDUCE_AXIS, src=(UPat.var("src"),), name="r"),), name="view"), swizzle_reduceop),
-  # passthrough elementwise ops
-  (UPat(GroupOp.All-{*GROUPED, Ops.SINK}, name="root"), passthrough_elementwise),
   # reduce on the base
   (UPat(Ops.REDUCE_AXIS, src=(UPat(Ops.VIEW, src=(UPat(GroupOp.All-GROUPED, name="src"),), name="v"),), name="r"), reduceop_view_right),
+  # passthrough elementwise ops
+  (UPat(GroupOp.All-{*GROUPED, Ops.SINK}, name="root"), passthrough_elementwise),
 ])
 
 # **** create kernels
@@ -217,6 +221,10 @@ add_buffer_ops = PatternMatcher([
   (UPat(Ops.ASSIGN, src=(UPat.var("x"), UPat())), lambda x:x),
   # STORE (except for COPY/BUFFER_VIEW)
   (UPat(Ops.SINK, src=(UPat((Ops.COPY, Ops.BUFFER_VIEW), name="x"),)), lambda x:x),
+  # assign is a store with an optionally non-contiguous ShapeTracker
+  (UPat(Ops.SINK, src=(UPat(Ops.ASSIGN, name="x"))),
+   lambda x: UOp.store(UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(x.size), (), 0), x.src[0].st.to_uop(), x.src[1]).sink()),
+  # otherwise it's a contiguous store
   (UPat(Ops.SINK, src=(UPat(GroupOp.All-{Ops.STORE}, name="x"),)),
    lambda x: UOp.store(UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(x.size), (), 0), ShapeTracker.from_shape(x.shape).to_uop(), x).sink()),
   # CONST/VALID
