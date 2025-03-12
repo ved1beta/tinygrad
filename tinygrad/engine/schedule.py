@@ -113,7 +113,7 @@ sym = symbolic_simple+PatternMatcher([
 
 # **** swizzler
 
-GROUPED = {Ops.BUFFER, Ops.ASSIGN, Ops.CONTIGUOUS, Ops.COPY, Ops.CONST}
+GROUPED = {Ops.BUFFER, Ops.ASSIGN, Ops.CONTIGUOUS, Ops.COPY, Ops.CONST, Ops.DEFINE_VAR}
 
 remove_sink_views = PatternMatcher([
   (UPat(Ops.SINK, name="x"), lambda x:x.replace(src=tuple(s.base for s in x.src)) if any(s.op is Ops.VIEW for s in x.src) else None),
@@ -122,7 +122,7 @@ remove_sink_views = PatternMatcher([
 view_left = merge_views+PatternMatcher([
   # realize before expand
   (UPat(Ops.VIEW, src=(UPat(GroupOp.All-{*GROUPED, Ops.DEVICE}, name="x"),), name="view"),
-   lambda view,x: x.contiguous().view(view.st) if prod(view.shape) > prod(x.shape) else None),
+   lambda view,x: x.contiguous().view(view.st) if resolve(prod(view.shape) > prod(x.shape)) else None),
   # do not push pads through unsafe ops
   (UPat(Ops.VIEW, src=(UPat(GroupOp.UnsafePad, name="unsafe"),), name="view"),
    lambda view,unsafe: unsafe.contiguous().view(view.st) if any(v.mask is not None for v in view.st.views) else None),
@@ -171,6 +171,23 @@ view_right = merge_views+PatternMatcher([
   (UPat(GroupOp.All-{*GROUPED, Ops.SINK}, name="root"), passthrough_elementwise),
 ])
 
+# **** unbind variables
+
+def unbind_shapetracker(ctx:dict[Variable, int], view:UOp):
+  st = unwrap(view.st).simplify()
+  if any(x.op is Ops.BIND for x in st.vars()):
+    st, var_vals = st.unbind()
+    ctx.update(var_vals)
+  return view.replace(arg=st) if st != view.st else None
+
+def unbind_variable(ctx:dict[Variable, int], bind:UOp, var:UOp, val:UOp):
+  ctx[var.replace(src=())] = val.arg
+  return var
+
+unbind_vars = PatternMatcher([
+  (UPat(Ops.BIND, name="bind", src=(UPat.var("var"), UPat.cvar("val"))), unbind_variable),
+])
+
 # **** create kernels
 
 @dataclass(frozen=True)
@@ -182,6 +199,7 @@ class Kernel:
 
 @dataclass(frozen=True)
 class KernelContext:
+  var_vals: dict[Variable, int]
   ops_metadata: dict[UOp, Metadata]
 
 def create_kernel(ctx:KernelContext, x:UOp, b:UOp):
@@ -214,6 +232,7 @@ create_kernels = merge_views+remove_sink_views+PatternMatcher([
   # all ops in SINK get a kernel
   (UPat(Ops.SINK, name="x"), lambda ctx,x: x.replace(src=new_src)
     if (new_src:=tuple(s if s.op in DONT_PLACE_IN_KERNEL else s.contiguous() for s in x.src)) != x.src else None),
+  (UPat(Ops.VIEW, name="view"), lambda ctx,view: unbind_shapetracker(ctx.var_vals, view)),
 ])
 
 # ** create buffer ops + enumerate buffers
@@ -231,7 +250,7 @@ add_buffer_ops = PatternMatcher([
   (UPat(Ops.SINK, src=(UPat(GroupOp.All-{Ops.STORE}, name="x"),)),
    lambda x: UOp.store(UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(x.size), (), 0), ShapeTracker.from_shape(x.shape).to_uop(), x).sink()),
   # VALID
-  (UPat(Ops.VIEW, src=(UPat(Ops.CONST, name="x"),), name="view"), lambda view,x:x.valid(view.arg)),
+  (UPat(Ops.VIEW, src=(UPat((Ops.CONST, Ops.DEFINE_VAR), name="x"),), name="view"), lambda view,x:x.valid(view.arg)),
   # remove CONTIGUOUS/DEVICE from kernel AST
   (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda x: x),
   (UPat(Ops.VIEW, src=(UPat(Ops.DEVICE),), name="view"), lambda view: view.replace(src=())),
@@ -243,7 +262,7 @@ add_buffer_ops = PatternMatcher([
    lambda store,base: store.replace(src=(store.src[0], (store.src[1].st+base.st).to_uop(), base))),
 ])+merge_views
 
-def fix_kernel_ast(k:UOp, var_vals:dict[Variable, int], idx:int) -> UOp:
+def fix_kernel_ast(k:UOp, idx:int) -> UOp:
   assert k.op is Ops.KERNEL, f"kernel isn't kernel, it's {k}"
   # add buffer ops
   ast = graph_rewrite(k.arg.ast, add_buffer_ops, bufs:=tuple(s.buf_uop for s in k.src), bottom_up=True, name=f"ast_{idx}")
@@ -274,15 +293,15 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
   # display the cleaned up tensor graph
   if getenv("VIZ"): graph_rewrite(tensor_map[big_sink], PatternMatcher([]), name="View Tensor Graph")
 
-  # view_left + view_right
+  # unbind_vars + view_left + view_right
   sink = tensor_map[big_sink]
-  vl_map = graph_rewrite_map(sink, view_left)
+  var_vals: dict[Variable, int] = {}
+  vl_map = graph_rewrite_map(sink, unbind_vars+view_left, ctx=var_vals)
   vr_map = graph_rewrite_map(vl_map[sink], view_right+remove_sink_views)
   contiguous_sink = vr_map[vl_map[sink]]
   if getenv("VIZ"): graph_rewrite(contiguous_sink, PatternMatcher([]), name="View Contiguous Graph")
   type_verify(list(contiguous_sink.toposort), contiguous_spec)
-  # create_kernels
-  kernel_map = graph_rewrite_map(contiguous_sink, create_kernels, ctx=KernelContext({}))
+  kernel_map = graph_rewrite_map(contiguous_sink, create_kernels, ctx=KernelContext(var_vals, {}))
   sched_sink = kernel_map[contiguous_sink]
   type_verify(list(sched_sink.toposort), kernel_spec)
   assert len(sched_sink.src) == len(sink.src)
@@ -342,11 +361,10 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
 
   queue = deque(k for k,v in in_degree.items() if v == 0)
   schedule: list[ScheduleItem] = []
-  var_vals: dict[Variable, int] = {}
   while queue:
     u = queue.popleft()
     # TODO: move this to create_kernels
-    k = fix_kernel_ast(u.src[1], var_vals, idx=len(schedule))
+    k = fix_kernel_ast(u.src[1], idx=len(schedule))
     schedule.append(ScheduleItem(k.arg.ast, tuple(s.buf_uop.buffer for s in k.src), k.arg.metadata))
     # increment the refcount of the target buf (this is required by the JIT and memory planner) TODO: this does not belong here
     k.src[0].buffer.ref(1)

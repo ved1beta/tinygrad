@@ -145,10 +145,12 @@ shape_spec = PatternMatcher([
   (UPat(GroupOp.All-{Ops.SINK}, name="root"), lambda root: all_same([x.shape for x in root.src if x.st is not None])),
 ])
 
+GROUPED = {Ops.BUFFER, Ops.ASSIGN, Ops.CONTIGUOUS, Ops.COPY, Ops.CONST, Ops.DEFINE_VAR}
+
 contiguous_spec = PatternMatcher([
-  (UPat((Ops.CONTIGUOUS, Ops.CONST), src=(UPat(Ops.VIEW),)), lambda:True),
+  (UPat((Ops.CONTIGUOUS, Ops.CONST, Ops.DEFINE_VAR), src=(UPat(Ops.VIEW),)), lambda:True),
   (UPat(GroupOp.All, name="x"),
-   lambda x: not any(s.op is Ops.VIEW and s.base.op not in {Ops.CONST, Ops.CONTIGUOUS, Ops.ASSIGN, Ops.COPY, Ops.BUFFER} for s in x.src)),
+   lambda x: not any(s.op is Ops.VIEW and s.base.op not in GROUPED for s in x.src)),
 ])+shape_spec
 
 # ***** uop helpers *****
