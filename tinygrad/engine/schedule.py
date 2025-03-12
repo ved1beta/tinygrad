@@ -204,6 +204,9 @@ create_kernels = merge_views+remove_sink_views+PatternMatcher([
   # always give assign/contiguous a kernel
   (UPat.assign(UPat.var("b"), UPat(GroupOp.All-{Ops.KERNEL}), name="x"), create_kernel),
   (UPat(Ops.CONTIGUOUS, name="x"), lambda ctx,x: create_kernel(ctx, x, UOp.new_buffer(x.device, x.size, x.dtype))),
+  # TODO: buffer_view should never need a kernel
+  (UPat(Ops.BUFFER_VIEW, name="x"),
+   lambda ctx,x: create_kernel(ctx, x, UOp.new_buffer(x.device, x.size, x.dtype)) if x.device.startswith("DISK") else None),
   # create a buffer for COPY on the new device
   (UPat(Ops.COPY, src=(UPat(Ops.DEVICE, name="d"), UPat()), name="x"), lambda ctx,d,x: create_kernel(ctx, x, UOp.new_buffer(d.arg, x.size, x.dtype))),
   # walk back the local graph until we reach a buffer/assign parent
@@ -232,6 +235,8 @@ add_buffer_ops = PatternMatcher([
   # remove CONTIGUOUS/DEVICE from kernel AST
   (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda x: x),
   (UPat(Ops.VIEW, src=(UPat(Ops.DEVICE),), name="view"), lambda view: view.replace(src=())),
+  # only buffer has ImageDType
+  (UPat(GroupOp.All-{Ops.DEFINE_GLOBAL}, name="x"), lambda x: x.replace(dtype=x.dtype.base) if isinstance(x.dtype, ImageDType) else None),
   # +merge_views
   (UPat(Ops.VIEW, src=(UPat(Ops.LOAD, name="x"),), name="view"), lambda view,x: x.replace(src=(x.src[0], (x.src[1].arg+view.arg).to_uop()))),
   (UPat(Ops.STORE, src=(UPat(), UPat(), UPat(Ops.VIEW, src=(UPat.var("base"),))), name="store"),
