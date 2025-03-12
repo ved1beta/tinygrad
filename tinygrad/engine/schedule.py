@@ -120,6 +120,9 @@ remove_sink_views = PatternMatcher([
 ])
 
 view_left = merge_views+PatternMatcher([
+  # do not push pads through unsafe ops
+  (UPat(Ops.VIEW, src=(UPat(GroupOp.UnsafePad, name="unsafe"),), name="view"),
+   lambda view,unsafe: unsafe.contiguous().view(view.st) if any(v.mask is not None for v in view.st.views) else None),
   # VIEW before elementwise/buffer ops
   (UPat(Ops.VIEW, src=(UPat(GroupOp.All-{*GROUPED, Ops.DEVICE, Ops.REDUCE_AXIS}, name="x"),), name="view"),
    lambda x,view: x.replace(src=tuple(UOp(Ops.VIEW, s.dtype, (s,), view.arg) for s in x.src))),
