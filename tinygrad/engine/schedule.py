@@ -119,6 +119,15 @@ remove_sink_views = PatternMatcher([
   (UPat(Ops.SINK, name="x"), lambda x:x.replace(src=tuple(s.base for s in x.src)) if any(s.op is Ops.VIEW for s in x.src) else None),
 ])
 
+view_left = merge_views+PatternMatcher([
+  # VIEW before elementwise/buffer ops
+  (UPat(Ops.VIEW, src=(UPat(GroupOp.All-{*GROUPED, Ops.DEVICE, Ops.REDUCE_AXIS}, name="x"),), name="view"),
+   lambda x,view: x.replace(src=tuple(UOp(Ops.VIEW, s.dtype, (s,), view.arg) for s in x.src))),
+])
+
+def apply_view_left(u:UOp):
+  with Context(TRACK_MATCH_STATS=0): return graph_rewrite(u, view_left)
+
 def swizzle_reduceop(r:UOp, src:UOp, view:UOp):
   if (st:=unwrap(view.st)).contiguous: return None
   input_st = ShapeTracker.from_shape(src.shape)
@@ -130,20 +139,15 @@ def swizzle_reduceop(r:UOp, src:UOp, view:UOp):
   # update input_st and axis
   new_input_st = tmp + ShapeTracker(tuple(nv))
   new_axis = tuple(range(len(st.shape), len(st.shape) + len(r.axis_arg)))
-  return UOp(Ops.REDUCE_AXIS, r.dtype, (UOp(Ops.VIEW, src.dtype, (src,), new_input_st),), (r.arg[0], new_axis)).reshape(st.shape)
-
-view_left = merge_views+PatternMatcher([
-  # VIEW before elementwise/buffer ops
-  (UPat(Ops.VIEW, src=(UPat(GroupOp.All-{*GROUPED, Ops.DEVICE, Ops.REDUCE_AXIS}, name="x"),), name="view"),
-   lambda x,view: x.replace(src=tuple(UOp(Ops.VIEW, s.dtype, (s,), view.arg) for s in x.src))),
-])
+  new_src = apply_view_left(UOp(Ops.VIEW, src.dtype, (src,), new_input_st))
+  return UOp(Ops.REDUCE_AXIS, r.dtype, (new_src,), (r.arg[0], new_axis)).reshape(st.shape)
 
 def passthrough_elementwise(root:UOp):
   if not (swizzles:=[x for x in root.src if x.op is Ops.VIEW and x.base.op not in GROUPED]): return None
   assert all_same([x.base.size for x in swizzles]), f"swizzle inputs must have the same size {swizzles}"
   # place view after applying the elementwise op
   new_shape = swizzles[0].base.shape
-  ret = root.replace(src=tuple(x.base if x.base.shape == new_shape else x.reshape(new_shape) for x in root.src))
+  ret = root.replace(src=tuple(x.base if x.base.shape == new_shape else apply_view_left(x.reshape(new_shape)) for x in root.src))
   # reshape to match downstream shapes
   return ret.reshape(root.shape)
 
