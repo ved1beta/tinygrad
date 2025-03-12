@@ -147,7 +147,8 @@ shape_spec = PatternMatcher([
 
 contiguous_spec = PatternMatcher([
   (UPat((Ops.CONTIGUOUS, Ops.CONST), src=(UPat(Ops.VIEW),)), lambda:True),
-  (UPat(GroupOp.All, name="x"), lambda x: not any(s.op is Ops.VIEW and s.base.op not in {Ops.CONST, Ops.CONTIGUOUS, Ops.ASSIGN, Ops.COPY, Ops.BUFFER} for s in x.src)),
+  (UPat(GroupOp.All, name="x"),
+   lambda x: not any(s.op is Ops.VIEW and s.base.op not in {Ops.CONST, Ops.CONTIGUOUS, Ops.ASSIGN, Ops.COPY, Ops.BUFFER} for s in x.src)),
 ])+shape_spec
 
 # ***** uop helpers *****

@@ -1,11 +1,11 @@
 import sys, atexit, pickle
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
 from tinygrad.ops import UOp, Variable, Ops, GroupOp, PatternMatcher, UPat, graph_rewrite, graph_rewrite_map, track_rewrites, buffers
-from tinygrad.ops import can_pad, identity_element, resolve, merge_views
+from tinygrad.ops import identity_element, resolve, merge_views
 from tinygrad.codegen.symbolic import symbolic_simple
-from tinygrad.helpers import Context, ContextVar, Metadata, all_int, all_same, colored, diskcache_put, prod, dedup, unwrap, flatten, getenv, pluralize
-from tinygrad.helpers import FUSE_CONV_BW, FUSE_ARANGE, DEBUG, CAPTURE_PROCESS_REPLAY, DONT_REALIZE_EXPAND, DONT_GROUP_REDUCES, SPLIT_REDUCEOP
+from tinygrad.helpers import Context, ContextVar, Metadata, all_int, all_same, diskcache_put, prod, dedup, unwrap, getenv, pluralize
+from tinygrad.helpers import DEBUG, CAPTURE_PROCESS_REPLAY, SPLIT_REDUCEOP
 from tinygrad.dtype import ImageDType
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.view import View, strides_for_shape
@@ -221,20 +221,21 @@ add_buffer_ops = PatternMatcher([
   (UPat(Ops.ASSIGN, src=(UPat.var("x"), UPat())), lambda x:x),
   # STORE (except for COPY/BUFFER_VIEW)
   (UPat(Ops.SINK, src=(UPat((Ops.COPY, Ops.BUFFER_VIEW), name="x"),)), lambda x:x),
-  # assign is a store with an optionally non-contiguous ShapeTracker
-  (UPat(Ops.SINK, src=(UPat(Ops.ASSIGN, name="x"))),
+  # partial assign can store to a non-contiguous ShapeTracker
+  (UPat(Ops.SINK, src=(UPat(Ops.ASSIGN, name="x"),)),
    lambda x: UOp.store(UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(x.size), (), 0), x.src[0].st.to_uop(), x.src[1]).sink()),
-  # otherwise it's a contiguous store
+  # otherwise the store is contiguous
   (UPat(Ops.SINK, src=(UPat(GroupOp.All-{Ops.STORE}, name="x"),)),
    lambda x: UOp.store(UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(x.size), (), 0), ShapeTracker.from_shape(x.shape).to_uop(), x).sink()),
-  # CONST/VALID
-  (UPat(Ops.CONST, src=(UPat(Ops.VIEW, src=(UPat(Ops.DEVICE),), name="view"),), name="x"), lambda x,view:x.replace(src=(view.arg.to_uop(),))),
+  # VALID
   (UPat(Ops.VIEW, src=(UPat(Ops.CONST, name="x"),), name="view"), lambda view,x:x.valid(view.arg)),
-  # no contiguous
-  (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda x:x),
+  # remove CONTIGUOUS/DEVICE from kernel AST
+  (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda x: x),
+  (UPat(Ops.VIEW, src=(UPat(Ops.DEVICE),), name="view"), lambda view: view.replace(src=())),
   # +merge_views
   (UPat(Ops.VIEW, src=(UPat(Ops.LOAD, name="x"),), name="view"), lambda view,x: x.replace(src=(x.src[0], (x.src[1].arg+view.arg).to_uop()))),
-  (UPat(Ops.STORE, src=(UPat.var("b"), UPat.var("st"), UPat(Ops.VIEW, src=(UPat.var("base"),)))), lambda b,st,base: UOp.store(b, st.view(base.st), base)),
+  (UPat(Ops.STORE, src=(UPat(), UPat(), UPat(Ops.VIEW, src=(UPat.var("base"),))), name="store"),
+   lambda store,base: store.replace(src=(store.src[0], (store.src[1].st+base.st).to_uop(), base))),
 ])+merge_views
 
 def fix_kernel_ast(k:UOp, var_vals:dict[Variable, int], idx:int) -> UOp:
@@ -290,7 +291,7 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
     vr = vr_map[vl]
     if vr.base not in kernel_map: continue
     kernel = kernel_map[vr.base]
-    if (a:=kernel.base).op is Ops.ASSIGN: buffer_map[v] = a.src[0] if a.src[0].st == v.st else a.src[0].view(unwrap(v.st))
+    if (k:=kernel.base).op is Ops.ASSIGN: buffer_map[v] = k.src[0] if k.src[0].st == v.st else k.src[0].view(unwrap(v.st))
 
   # map tensors to buffer/const, optionally apply a VIEW on top
   becomes_map: dict[UOp, UOp] = {}
