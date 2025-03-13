@@ -524,7 +524,11 @@ class Tensor(SimpleMathTrait):
         device=device, dtype=dtypes.uint32, requires_grad=False)
       Tensor._device_rng_counters[device] = Tensor([0], device=device, dtype=dtypes.uint32, requires_grad=False)
     # increment rng counter for devices
-    else: Tensor._device_rng_counters[device].assign(Tensor._device_rng_counters[device] + num).contiguous()
+    # NOTE: this contiguous exists to ensure ASSIGN always realizes the tensor
+    # otherwise the seed increment becomes a replace when put in the JIT
+    else:
+      incr = Tensor._device_rng_counters[device].assign(Tensor._device_rng_counters[device] + num)
+      incr.replace(incr.contiguous())
 
     # threefry random bits
     counts0 = (Tensor.arange(ceildiv(num, 2), device=device, dtype=dtypes.uint32, requires_grad=False)+Tensor._device_rng_counters[device])
