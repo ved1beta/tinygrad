@@ -425,6 +425,7 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
   ops_metadata = {v:k.metadata for k,v in tensor_map.items() if k.base.op not in {Ops.CONST, Ops.DEVICE} and isinstance(k.metadata, Metadata)}
   # create_kernels
   kernel_map = graph_rewrite_map(sink, create_kernels, ctx=KernelContext(realize_map, ops_metadata), bottom_up=True)
+  buffer_map = {k:v.base.buf_uop for k,v in kernel_map.items() if v.base.op is Ops.ASSIGN}
   sched_sink = kernel_map[sink]
   type_verify(list(sched_sink.toposort), kernel_spec)
 
@@ -434,8 +435,7 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
     # ASSIGN always becomes the target buffer
     if v.op is Ops.ASSIGN: becomes_map[k] = v.src[0]
     # if we created a new buffer for this tensor, map it to the assigned buffer
-    elif (a:=kernel_map.get(v.base)) is not None and (a:=a.base).op is Ops.ASSIGN:
-      becomes_map[k] = a.src[0] if a.src[0].st == v.st else a.src[0].view(unwrap(v.st))
+    elif (buf:=buffer_map.get(v.base)) is not None: becomes_map[k] = buf if buf.st == v.st else buf.view(unwrap(v.st))
     # tensors can also simplify to an existing buffer/const
     else:
       if k is v: continue
