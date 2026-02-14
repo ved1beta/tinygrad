@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 import unittest
 import numpy as np
-from tinygrad.frontend.onnx import OnnxRunner
+from tinygrad.nn.onnx import OnnxRunner
 from tinygrad.device import Device
 from tinygrad.helpers import fetch, Context
 
@@ -73,7 +73,7 @@ class TestHuggingFaceOnnxModels(unittest.TestCase):
     onnx_model_path = snapshot_download_with_retry(
       repo_id=repo_id,
       allow_patterns=["*.onnx", "*.onnx_data"],
-      cache_dir=str(DOWNLOADS_DIR)
+      local_dir=DOWNLOADS_DIR / repo_id
     )
     onnx_model_path = onnx_model_path / model_file
     file_size = onnx_model_path.stat().st_size
